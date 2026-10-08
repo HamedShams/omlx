@@ -3656,8 +3656,26 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
+    if entry.is_loading:
+        raise HTTPException(status_code=409, detail=f"Model still loading: {model_id}")
 
-    await _server_state.engine_pool._unload_engine(model_id)
+    # Same path as the admin route (#4378): an idle engine unloads now; an
+    # active one has its requests aborted first, so streaming clients get an
+    # error frame instead of a connection that never closes, and the
+    # teardown waits for the scheduler to drain.
+    unloaded = await _server_state.engine_pool.request_unload(
+        model_id, reason="manual unload"
+    )
+    if not unloaded:
+        logger.info("Queued manual unload for active model: %s", model_id)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "unloading",
+                "model_id": model_id,
+                "message": f"Aborting active requests before unloading {model_id}",
+            },
+        )
     return {"status": "ok", "model_id": model_id}
 
 

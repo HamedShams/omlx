@@ -69,3 +69,63 @@ async def test_lease_rejected_during_manual_unload_uses_unload_error():
     assert exc_info.value.detail == (
         "Request aborted because this model is being unloaded."
     )
+
+
+@pytest.mark.asyncio
+async def test_public_unload_of_active_model_aborts_requests_first():
+    # /v1/models/{id}/unload used to call _unload_engine directly, which
+    # stopped the engine without finishing the active requests' collectors,
+    # so a streaming client hung forever (#4378).
+    entry = MagicMock()
+    entry.engine = object()
+    entry.is_loading = False
+    pool = MagicMock()
+    pool.get_entry.return_value = entry
+    pool.request_unload = AsyncMock(return_value=False)
+
+    with patch.object(server._server_state, "engine_pool", pool):
+        response = await server.unload_model("model-a", _=True)
+
+    assert response.status_code == 202
+    assert json.loads(response.body) == {
+        "status": "unloading",
+        "model_id": "model-a",
+        "message": "Aborting active requests before unloading model-a",
+    }
+    pool.request_unload.assert_awaited_once_with("model-a", reason="manual unload")
+    pool._unload_engine.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_public_unload_of_idle_model_returns_ok():
+    entry = MagicMock()
+    entry.engine = object()
+    entry.is_loading = False
+    pool = MagicMock()
+    pool.get_entry.return_value = entry
+    pool.request_unload = AsyncMock(return_value=True)
+
+    with patch.object(server._server_state, "engine_pool", pool):
+        response = await server.unload_model("model-a", _=True)
+
+    assert response == {"status": "ok", "model_id": "model-a"}
+    pool.request_unload.assert_awaited_once_with("model-a", reason="manual unload")
+
+
+@pytest.mark.asyncio
+async def test_public_unload_rejects_a_model_that_is_still_loading():
+    entry = MagicMock()
+    entry.engine = object()
+    entry.is_loading = True
+    pool = MagicMock()
+    pool.get_entry.return_value = entry
+    pool.request_unload = AsyncMock()
+
+    with (
+        patch.object(server._server_state, "engine_pool", pool),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await server.unload_model("model-a", _=True)
+
+    assert exc_info.value.status_code == 409
+    pool.request_unload.assert_not_awaited()
