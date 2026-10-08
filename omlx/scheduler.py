@@ -260,6 +260,20 @@ class _StopOutputState:
 
     strings: dict[tuple[int, ...], str]
     pending: deque[tuple[int, RequestOutput]] = field(default_factory=deque)
+    # Stop strings end the answer, not the reasoning (#3943). On a request
+    # that can reason, ``gated`` keeps the tokenized strings out of the
+    # generator's StopSequences and text matching pauses while the output
+    # is inside a think block. When the block closes, the answer's start is
+    # recorded for each text the matcher reads: the streaming detokenizer
+    # text, the parser's visible text and the token list.
+    gated: bool = False
+    in_thinking: bool = False
+    think_start_ids: tuple[int, ...] = ()
+    think_end_ids: tuple[int, ...] = ()
+    recent_tokens: list[int] = field(default_factory=list)
+    search_start: int = 0
+    visible_start: int = 0
+    answer_token_start: int = 0
 
 
 def _safe_sync_stream(stream=None):
@@ -6714,6 +6728,25 @@ class Scheduler:
         sequences = [[t] for t in stop_tokens_set]
         stop_sequence_strings: dict[tuple[int, ...], str] = {}
 
+        # Stop strings end the answer, not the reasoning (#3943). On a
+        # request that can reason they stay out of the generator's
+        # StopSequences: a token match inside the think block would end the
+        # row before the answer starts, and nothing can resume it. The text
+        # matcher in _process_batch_responses, which already ends a row on
+        # its own, detects them once the think block has closed.
+        gated = self._stop_strings_follow_thinking(request)
+        think_start_ids: tuple[int, ...] = ()
+        think_end_ids: tuple[int, ...] = ()
+        if gated:
+            request_think_end_id = getattr(request, "think_end_token_id", None)
+            if request_think_end_id is not None:
+                think_end_ids = (int(request_think_end_id),)
+            else:
+                think_end_ids = tuple(self._resolve_think_end_token_ids() or ())
+            think_start_ids = tuple(self._resolve_think_start_token_ids() or ())
+            # Without a close marker there is no answer boundary to find.
+            gated = bool(think_end_ids)
+
         # Tokenize stop strings into token sequences. mlx-lm's
         # StopSequences uses Aho-Corasick, so per-token match
         # cost stays O(1) regardless of how many sequences are added.
@@ -6727,16 +6760,85 @@ class Scheduler:
                 seq = self.tokenizer.encode(stop_str)
             if seq:
                 token_sequence = tuple(int(token) for token in seq)
-                sequences.append(list(token_sequence))
+                if not gated:
+                    sequences.append(list(token_sequence))
                 stop_sequence_strings[token_sequence] = stop_str
+
+        gated = gated and bool(stop_sequence_strings)
 
         # Response-side buffering is request-local so normal completion,
         # retry, and cleanup paths do not need any new scheduler lifecycle.
         request._stop_output_state = _StopOutputState(  # type: ignore[attr-defined]
-            strings=stop_sequence_strings
+            strings=stop_sequence_strings,
+            gated=gated,
+            in_thinking=gated and bool(getattr(request, "needs_think_prefix", False)),
+            think_start_ids=think_start_ids,
+            think_end_ids=think_end_ids,
         )
 
         return StopSequences(sequences)
+
+    def _stop_strings_follow_thinking(self, request: "Request") -> bool:
+        """True when the request's stop strings should skip its reasoning.
+
+        OpenAI's ``stop`` and Anthropic's ``stop_sequences`` end the
+        response; reasoning travels on its own channel. A request can
+        reason when its prompt opened a think block, when the output parser
+        frames one, or when the tokenizer knows the think markers.
+        """
+        if getattr(request, "needs_think_prefix", False):
+            return True
+        if self._get_output_parser_thinking_end_text() is not None:
+            return True
+        return bool(getattr(self.tokenizer, "has_thinking", False))
+
+    def _resolve_think_start_token_ids(self) -> list[int] | None:
+        """Resolve token ID(s) for the open-think tag, parser marker first."""
+        parser_think_start = self._get_output_parser_thinking_start_text()
+        if parser_think_start is not None:
+            return self._encode_thinking_marker(parser_think_start)
+        tokens = self._get_think_token_id("think_start_tokens")
+        if tokens:
+            return [int(token) for token in tokens]
+        think_start_id = self._get_think_token_id("think_start_id")
+        if think_start_id is not None:
+            return [think_start_id]
+        return None
+
+    def _advance_stop_thinking(
+        self, request: "Request", token: int, detokenizer: Any
+    ) -> bool:
+        """Follow the think block for stop-string gating; True on its close.
+
+        A sliding window over the generated tokens finds the markers, as
+        ``ThinkingBudgetProcessor`` does, so multi-token and parser-specific
+        markers are covered. On the close, the answer's start is recorded in
+        every text the stop matcher reads.
+        """
+        state = getattr(request, "_stop_output_state", None)
+        if state is None or not state.gated:
+            return False
+        recent = state.recent_tokens
+        recent.append(int(token))
+        window = max(len(state.think_start_ids), len(state.think_end_ids), 1)
+        del recent[:-window]
+        if state.in_thinking:
+            end = state.think_end_ids
+            if end and tuple(recent[-len(end) :]) == end:
+                state.in_thinking = False
+                state.answer_token_start = len(request.output_token_ids)
+                state.search_start = (
+                    len(detokenizer.text) if detokenizer is not None else 0
+                )
+                state.visible_start = len(request.output_text)
+                recent.clear()
+                return True
+            return False
+        start = state.think_start_ids
+        if start and tuple(recent[-len(start) :]) == start:
+            state.in_thinking = True
+            recent.clear()
+        return False
 
     def _buffer_stop_sequence_output(
         self,
@@ -6757,6 +6859,13 @@ class Scheduler:
             return [output]
 
         pending = state.pending
+        if state.in_thinking:
+            # Reasoning streams as it comes: nothing in it can match a stop
+            # string, so no prefix is held back and a held one is released.
+            ready = [pending_output for _, pending_output in pending]
+            pending.clear()
+            ready.append(output)
+            return ready
         if stop_prefix_chars is not None:
             # The text matcher already clipped this chunk and the final text.
             # Remove only the matched characters from earlier pending chunks.
@@ -12402,7 +12511,22 @@ class Scheduler:
             # Pending chunks retain prefixes even when contextual BPE tokens
             # differ from the standalone stop encoding.
             stop_strs = request.sampling_params.stop or []
-            if stop_strs and (not is_stop or new_text):
+            stop_state = getattr(request, "_stop_output_state", None)
+            # Reasoning never matches a stop string (#3943): the think block
+            # is skipped, and the chunk that closes it holds no answer yet.
+            think_closed = False
+            if stop_strs and not is_stop:
+                think_closed = self._advance_stop_thinking(
+                    request,
+                    response.token,
+                    detokenizer if parser_session is None else None,
+                )
+            skip_match = (
+                stop_state is not None
+                and stop_state.gated
+                and (stop_state.in_thinking or think_closed)
+            )
+            if stop_strs and not skip_match and (not is_stop or new_text):
                 if parser_session is not None:
                     state = getattr(request, "_stop_output_state", None)
                     pending_text = (
@@ -12411,13 +12535,15 @@ class Scheduler:
                         else ""
                     )
                     full_text = pending_text + new_text
+                    floor = 0
                 else:
                     full_text = (
                         detokenizer.text if detokenizer is not None else new_text
                     )
+                    floor = stop_state.search_start if stop_state is not None else 0
                 prev_len = len(full_text) - len(new_text)
                 matches = [
-                    full_text.find(ss, max(0, prev_len - len(ss) + 1))
+                    full_text.find(ss, max(floor, prev_len - len(ss) + 1))
                     for ss in stop_strs
                     if ss
                 ]
@@ -12539,8 +12665,17 @@ class Scheduler:
                     request.output_text = output.output_text
 
                 # Finalization may release a parser marker or incomplete UTF-8
-                # text. Apply the same stop boundary before flushing that text.
-                if stop_strs and stop_prefix_chars is None:
+                # text. Apply the same stop boundary before flushing that text,
+                # unless the output ended inside its think block.
+                if (
+                    stop_strs
+                    and stop_prefix_chars is None
+                    and not (
+                        stop_state is not None
+                        and stop_state.gated
+                        and stop_state.in_thinking
+                    )
+                ):
                     state = getattr(request, "_stop_output_state", None)
                     pending_text = (
                         "".join(chunk.new_text for _, chunk in state.pending)
@@ -12561,10 +12696,25 @@ class Scheduler:
                         output.new_token_ids = []
                         output.tool_calls = []
 
-                # Both parser and ordinary text omit the first matched stop.
+                # Both parser and ordinary text omit the first matched stop,
+                # searched from where the answer starts on a reasoning request.
                 if is_stop:
+                    answer_start = 0
+                    if stop_state is not None and stop_state.gated:
+                        if stop_state.in_thinking:
+                            answer_start = len(output.output_text)
+                        elif parser_session is not None:
+                            answer_start = stop_state.visible_start
+                        elif stop_state.answer_token_start:
+                            answer_start = len(
+                                self.tokenizer.decode(
+                                    request.output_token_ids[
+                                        : stop_state.answer_token_start
+                                    ]
+                                )
+                            )
                     matches = [
-                        output.output_text.find(ss)
+                        output.output_text.find(ss, answer_start)
                         for ss in request.sampling_params.stop or []
                         if ss
                     ]
