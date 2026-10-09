@@ -391,8 +391,8 @@ class LagunaTopKRouter(nn.Module):
         # MLX 0.32 a two-output compiled function with a shared intermediate is
         # bit-exact on some Apple GPUs and ULP-divergent on others. This feeds
         # argpartition expert selection, so it stays eager for portable token
-        # exactness (see docs/laguna-mlxfast-port-correctness.md C1). Only the
-        # single-output top-k renormalization below is compiled.
+        # exactness. Only the single-output top-k renormalization below is
+        # compiled.
         k = self.top_k
         inds = mx.stop_gradient(
             mx.argpartition(-corrected_scores, kth=k - 1, axis=-1)[..., :k]

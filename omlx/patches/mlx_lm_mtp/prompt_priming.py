@@ -49,6 +49,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, List, Optional
 
+from ...prefill.packed import PackedBatch, packed_batch_of
+
 logger = logging.getLogger(__name__)
 
 # The MTP head is fed the trunk's *post-norm* hidden and chains on its own
@@ -417,6 +419,8 @@ def capture_eligible(host: Any, cache: Optional[List[Any]]) -> bool:
 class _OwnedPriming:
     requests: dict = field(default_factory=dict)
     uids: dict = field(default_factory=dict)
+    # Request selected by the last ``activate_request`` (DSpark capture).
+    active: Optional[str] = None
 
 
 _OWNED_ATTR = "_omlx_mtp_owned_priming"
@@ -426,7 +430,7 @@ _PREFILL_SCOPE = ContextVar("omlx_mtp_priming_prefill", default=None)
 
 def _owned(model, create=False):
     host = _eligible_host(model)
-    if host is None or getattr(host, "_omlx_dspark_decode_enabled", False):
+    if host is None:
         return None, None
     state = getattr(host, _OWNED_ATTR, None)
     if not isinstance(state, _OwnedPriming):
@@ -434,6 +438,12 @@ def _owned(model, create=False):
         if state is not None:
             setattr(host, _OWNED_ATTR, state)
     return host, state
+
+
+def _dspark(host):
+    """DSpark keeps its own context type in the slot; it shares the request and
+    UID transport but not generic capture or head-history retention."""
+    return bool(getattr(host, "_omlx_dspark_decode_enabled", False))
 
 
 def _slot(host):
@@ -454,6 +464,43 @@ def activate_request(model, request_id):
     host, state = _owned(model)
     if state is not None:
         _restore_slot(host, state.requests.get(request_id, (None, None)))
+        state.active = request_id
+
+
+def owned_capture(host, capture):
+    """Run a host-specific ``capture()`` on the context of its owner.
+
+    ``capture`` reads and writes the host slot (DSpark). Inside a generator
+    prefill or decode step of one row (the final prompt token is fed by the
+    first decode step) the row's UID record is swapped in and stored back;
+    otherwise the slot belongs to the request chosen by
+    :func:`activate_request`.
+    """
+    _, state = _owned(host)
+    if state is None:
+        capture()
+        return
+    uids = None
+    prefill, decode = _PREFILL_SCOPE.get(), _DECODE_SCOPE.get()
+    if prefill is not None and prefill["host"] is host:
+        uids = prefill["uids"]
+    elif decode is not None and decode[0] is host:
+        uids = decode[1]
+    if uids is not None and len(uids) == 1:
+        uid = uids[0]
+        record = state.uids.get(uid)
+        if record is not None:
+            previous = _slot(host)
+            try:
+                _restore_slot(host, record)
+                capture()
+                state.uids[uid] = _slot(host)
+            finally:
+                _restore_slot(host, previous)
+            return
+    capture()
+    if state.active in state.requests:
+        state.requests[state.active] = _slot(host)
 
 
 def bind_uid(model, request_id, uid):
@@ -466,8 +513,12 @@ def bind_uid(model, request_id, uid):
         if uid in state.uids:
             raise RuntimeError("Lightning MTP priming UID already owned")
         state.uids[uid] = record
+    if state.active == request_id:
+        state.active = None
     current = _find_plan(host)
-    if current is not None and current.request_id == request_id:
+    if (current is not None and current.request_id == request_id) or (
+        record is not None and record[0] is not None and _find_ctx(host) is record[0]
+    ):
         drop_ctx(host)
 
 
@@ -549,6 +600,10 @@ def prepare_prefix_context(model, *, request_id, **kwargs):
     host, state = _owned(model, create=priming_enabled())
     if state is None:
         return _prepare_prefix_context(model, request_id=request_id, **kwargs)
+    if _dspark(host):
+        # Register only; another request's context may still occupy the slot.
+        state.requests.setdefault(request_id, (None, None))
+        return False
     activate_request(model, request_id)
     result = _prepare_prefix_context(model, request_id=request_id, **kwargs)
     record = _slot(host)
@@ -795,8 +850,34 @@ def _row_offsets(cache, size):
     return None
 
 
+def _capture_packed(host, inputs, normed, batch: PackedBatch) -> None:
+    """Fold each packed row into its own request's priming slot."""
+    _, state = _owned(host)
+    if state is None:
+        return
+    previous = _slot(host)
+    try:
+        for row, (start, end) in zip(batch.rows, batch.spans):
+            record = state.requests.get(row.request_id)
+            if record is None:
+                continue
+            _restore_slot(host, record)
+            _capture_single(
+                host, inputs[:, start:end], normed[:, start:end], row.cache
+            )
+            plan = _find_plan(host)
+            if plan is not None and plan.request_id in state.requests:
+                state.requests[plan.request_id] = _slot(host)
+    finally:
+        _restore_slot(host, previous)
+
+
 def maybe_capture(host, inputs, normed, cache):
     if _suppressed() or not priming_enabled():
+        return
+    batch = packed_batch_of(cache)
+    if batch is not None:
+        _capture_packed(host, inputs, normed, batch)
         return
     _, state = _owned(host)
     prefill = _PREFILL_SCOPE.get()
@@ -866,7 +947,7 @@ def retain_batch_head_history(batch, owner):
     if not priming_enabled():
         return
     host, registry = _owned(batch.model, create=True)
-    if registry is None:
+    if registry is None or _dspark(host):
         # Models with their own priming transport retain their existing path.
         logger.debug("MTP head history retention: model-owned priming transport")
         return
@@ -914,7 +995,7 @@ def retain_parked_head_history(model, uid, mtp_cache, folded, pending_hidden, ca
         return
     host, registry = _owned(model, create=True)
     anchor = _anchor(cache)
-    if registry is None or anchor is None or uid in registry.uids:
+    if registry is None or _dspark(host) or anchor is None or uid in registry.uids:
         return
     ctx = _PrimeCtx(
         mtp_cache=mtp_cache,
@@ -1169,7 +1250,7 @@ def take_primed(model, cache, main_tok, *, uid=None, cache_offset=None):
     if record is None:
         # Never consume another scheduler request's cursor at activation.
         ctx, plan = previous
-        if plan is not None or (ctx is not None and ctx.request_id is not None):
+        if plan is not None or getattr(ctx, "request_id", None) is not None:
             return None
         return _take_primed(model, cache, main_tok, cache_offset=cache_offset)
     try:

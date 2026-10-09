@@ -1653,7 +1653,7 @@ class ModelSettingsManager:
 
     def list_templates(self) -> list[dict]:
         # Shipped JSON seeds were retired in favor of the client-side preset
-        # bundle (`omlx/admin/static/omlx_preset.json`); every entry on this
+        # bundle (`omlx_web/static/omlx_preset.json`); every entry on this
         # surface is user-created. Callers that distinguish presets from
         # user templates do so via the preset bundle, not an `is_builtin`
         # flag on this response.

@@ -40,6 +40,8 @@ The server provides:
 
 import argparse
 import asyncio
+import importlib
+import importlib.util
 import inspect
 import json
 import logging
@@ -48,7 +50,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
@@ -88,6 +90,7 @@ from .api.anthropic_utils import (
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
+from .api.body_limit import RequestBodySizeLimitMiddleware
 from .api.embedding_models import (
     EmbeddingData,
     EmbeddingRequest,
@@ -191,7 +194,7 @@ from .api.utils import (
     cache_reasoning_output,
     uses_native_reasoning_content,
 )
-from .engine import BaseEngine, GenerationOutput, VLMBatchedEngine
+from .engine import BaseEngine, BatchedEngine, GenerationOutput, VLMBatchedEngine
 from .engine.distributed import DistributedInferenceError
 from .engine.vlm import MINIMAX_M3_MODEL_TYPES
 from .engine.embedding import EmbeddingEngine
@@ -213,6 +216,7 @@ from .exceptions import (
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .models.decision import DecisionContextLengthError, DecisionRequestError
+from .prefill_progress import get_prefill_tracker
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -779,9 +783,14 @@ except ImportError:
     pass
 
 # Include admin routes
-from .admin.auth import _RedirectToLogin, require_admin
+from .admin.auth import _RedirectToLogin, require_admin, set_web_ui_enabled
+from .admin.routes import (
+    configured_api_key,
+    configured_ui_language,
+    is_admin_request,
+    set_admin_getters,
+)
 from .admin.routes import router as admin_router
-from .admin.routes import set_admin_getters
 
 set_admin_getters(
     get_server_state,
@@ -789,6 +798,34 @@ set_admin_getters(
     lambda: _server_state.settings_manager,
     lambda: _server_state.global_settings,
 )
+
+
+def _load_web_ui():
+    """Return the omlx_web package, or None to serve the API only."""
+    if os.environ.get("OMLX_HEADLESS", "0") == "1":
+        logger.info("Headless mode: serving the API without the web UI")
+        return None
+    if importlib.util.find_spec("omlx_web") is None:
+        logger.warning("Web UI package omlx_web is not installed; serving the API only")
+        return None
+    return importlib.import_module("omlx_web")
+
+
+_web_ui = _load_web_ui()
+if _web_ui is None:
+    set_web_ui_enabled(False)
+else:
+    _web_ui.set_host(
+        _web_ui.WebUIHost(
+            version=__version__,
+            require_admin=require_admin,
+            is_admin=is_admin_request,
+            ui_language=configured_ui_language,
+            main_api_key=configured_api_key,
+        )
+    )
+    # Before admin_router so the page routes keep their original order.
+    app.include_router(_web_ui.router)
 app.include_router(admin_router)
 
 _cluster_routes_registered = False
@@ -1332,6 +1369,9 @@ class ClientDisconnectTrackingMiddleware:
 # passes through the same one-shot disconnect fan-out.
 app.add_middleware(ClientDisconnectTrackingMiddleware)
 app.add_middleware(DebugRequestLoggingMiddleware)
+# Outermost so oversized bodies are rejected before any buffering below
+# (the debug middleware caches the whole textual body at trace level).
+app.add_middleware(RequestBodySizeLimitMiddleware)
 
 
 # =============================================================================
@@ -2181,6 +2221,30 @@ def get_embedding_max_length(
     return get_max_context_window(model_id)
 
 
+def _prepare_chat_prompt_for_request(
+    engine: BaseEngine,
+    messages: list,
+    tools: list | None = None,
+    chat_template_kwargs: dict | None = None,
+    is_partial: bool | None = None,
+) -> tuple[int, tuple[str, list[int]] | None]:
+    # Subclasses (e.g. distributed) have their own prompt handling.
+    if type(engine) is BatchedEngine:
+        prepared = engine.prepare_chat_prompt(
+            messages, tools, chat_template_kwargs, is_partial
+        )
+        return len(prepared[1]), prepared
+    return (
+        engine.count_chat_tokens(
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        ),
+        None,
+    )
+
+
 def validate_context_window(
     num_prompt_tokens: int, model_id: str | None = None
 ) -> None:
@@ -2266,11 +2330,6 @@ def init_server(
             / "response-state"
         )
     _server_state.responses_store = ResponseStore(state_dir=response_state_dir)
-
-    # Refresh i18n with loaded language setting
-    from .admin.routes import _refresh_i18n_globals
-
-    _refresh_i18n_globals()
 
     # Initialize auth with persistent secret key
     if global_settings:
@@ -2653,6 +2712,85 @@ async def _aclose_async_iterator(iterator: object) -> None:
     close = getattr(iterator, "aclose", None)
     if callable(close):
         await close()
+
+
+_PROMPT_PROGRESS_POLL_S = 0.5
+
+
+@dataclass(frozen=True)
+class _PromptProgress:
+    """llama.cpp ``prompt_progress`` payload. Token counts include the cache."""
+
+    total: int
+    cache: int
+    processed: int
+    time_ms: int
+
+
+async def _with_prompt_progress(
+    outputs: AsyncIterator[GenerationOutput],
+    request_id: str,
+) -> AsyncIterator[GenerationOutput | _PromptProgress]:
+    """Interleave ``_PromptProgress`` events before the first engine output.
+
+    Event order matches llama.cpp: 0% (``processed == cache``), strictly
+    increasing updates, then 100% right before the first output.
+    """
+    tracker = get_prefill_tracker()
+    ait = outputs.__aiter__()
+    start = time.monotonic()
+    task: asyncio.Future | None = asyncio.ensure_future(_safe_anext(ait))
+    totals: tuple[int, int] | None = None
+    sent = -1
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_PROMPT_PROGRESS_POLL_S)
+            if done:
+                break
+            entry = tracker.get(request_id)
+            # SpecPrefill phases count draft-scored and sparse tokens, not the prompt.
+            if (
+                not entry
+                or entry.get("phase") != "prefill"
+                or not entry.get("prompt_tokens")
+                or entry["total"] <= 0
+            ):
+                continue
+            if totals is None:
+                totals = (entry["prompt_tokens"], entry["cached_tokens"])
+                # Like llama.cpp, count time from prefill start, not queue entry.
+                start = entry.get("prefill_started_at") or start
+                yield _PromptProgress(totals[0], totals[1], totals[1], 0)
+                sent = totals[1]
+            total, cache = totals
+            # Tracker counts cover only the uncached suffix.
+            processed = cache + (total - cache) * entry["processed"] // entry["total"]
+            if sent < processed < total:
+                # Stamp with the scheduler's update time, not the poll time.
+                time_ms = int((entry["last_time"] - start) * 1000)
+                yield _PromptProgress(total, cache, processed, time_ms)
+                sent = processed
+        first = task.result()
+        task = None
+        if first is _KEEPALIVE_SENTINEL:
+            return
+        if totals is None and first.prompt_tokens > 0:
+            cache = min(first.cached_tokens, first.prompt_tokens)
+            totals = (first.prompt_tokens, cache)
+            yield _PromptProgress(totals[0], totals[1], totals[1], 0)
+            sent = totals[1]
+        if totals is not None and sent < totals[0]:
+            time_ms = int((time.monotonic() - start) * 1000)
+            yield _PromptProgress(totals[0], totals[1], totals[0], time_ms)
+        yield first
+        async for output in ait:
+            yield output
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        await _aclose_async_iterator(outputs)
 
 
 def _request_abort_id(engine: BaseEngine) -> str | None:
@@ -4465,6 +4603,8 @@ async def create_chat_completion(
                 messages = _inject_json_instruction(messages, json_instruction)
 
         tools_for_template = _resolve_template_tools(request, engine, resolved_model)
+        # Resolve template defaults before preparing the prompt for reuse.
+        _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
         await _ensure_tokenizer_for_system_probe(engine, messages)
         messages = prepare_system_messages_for_template(
             messages,
@@ -4477,7 +4617,8 @@ async def create_chat_completion(
         )
         # Validate context window before sending to model
         try:
-            num_prompt_tokens = engine.count_chat_tokens(
+            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
+                engine,
                 messages,
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
@@ -4543,7 +4684,8 @@ async def create_chat_completion(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
+        if prepared_prompt is not None:
+            chat_kwargs["_prepared_prompt"] = prepared_prompt
 
         # Add compiled grammar for logit-level structured output.
         # When a reasoning_parser is configured, the structural tag includes
@@ -4735,11 +4877,9 @@ async def create_chat_completion(
 
             # Process response_format if specified
             if response_format and not tool_calls:
-                cleaned_text, parsed_json, is_valid, error = parse_json_output(
+                cleaned_text, _, is_valid, error = parse_json_output(
                     cleaned_text or regular_content, response_format
                 )
-                if parsed_json is not None:
-                    cleaned_text = json.dumps(parsed_json)
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")
 
@@ -5331,6 +5471,10 @@ async def stream_completion(
         gen_kwargs["thinking_budget"] = thinking_budget
     if inference_request_id is not None:
         gen_kwargs["_request_id"] = inference_request_id
+    progress_request_id = None
+    if request.return_progress:
+        # The engine keys the prefill tracker by this id.
+        progress_request_id = gen_kwargs.setdefault("_request_id", str(uuid.uuid4()))
     # Widen the repetition-penalty look-back window when the client
     # asks for it (mlx-lm default window is 20 tokens).
     repetition_context_size = getattr(
@@ -5338,23 +5482,37 @@ async def stream_completion(
     )
     if repetition_context_size is not None:
         gen_kwargs["repetition_context_size"] = repetition_context_size
+    outputs = engine.stream_generate(
+        prompt=prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
+        repetition_penalty=repetition_penalty,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+        xtc_probability=xtc_probability,
+        xtc_threshold=xtc_threshold,
+        stop=request.stop,
+        seed=request.seed,
+        **gen_kwargs,
+    )
+    if progress_request_id is not None:
+        outputs = _with_prompt_progress(outputs, progress_request_id)
     try:
-        async for output in engine.stream_generate(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty,
-            xtc_probability=xtc_probability,
-            xtc_threshold=xtc_threshold,
-            stop=request.stop,
-            seed=request.seed,
-            **gen_kwargs,
-        ):
+        async for output in outputs:
+            if isinstance(output, _PromptProgress):
+                data = {
+                    "id": response_id,
+                    "object": "text_completion",
+                    "created": int(time.time()),
+                    "model": request.model,
+                    "choices": [{"index": 0, "text": "", "finish_reason": None}],
+                    "prompt_progress": asdict(output),
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+                continue
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -5480,6 +5638,9 @@ def _render_chat_prompt_for_thinking_detection(
     messages: list,
     kwargs: dict,
 ) -> tuple[str, list[int] | None]:
+    prepared = kwargs.get("_prepared_prompt")
+    if prepared is not None:
+        return prepared
     tokenizer = getattr(engine, "tokenizer", None)
     if tokenizer is None:
         return "", None
@@ -5792,9 +5953,30 @@ async def stream_chat_completion(
             thinking_filter = _thinking_filter
         else:
             stream_content = False
+    progress_request_id = None
+    if request.return_progress:
+        # The engine keys the prefill tracker by this id.
+        progress_request_id = kwargs.setdefault("_request_id", str(uuid.uuid4()))
     engine_stream = engine.stream_chat(messages=messages, **kwargs)
+    if progress_request_id is not None:
+        engine_stream = _with_prompt_progress(engine_stream, progress_request_id)
     try:
         async for output in engine_stream:
+            if isinstance(output, _PromptProgress):
+                progress_chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(
+                                role="assistant", content=""
+                            ),
+                        )
+                    ],
+                ).model_dump(exclude_none=True)
+                progress_chunk["prompt_progress"] = asdict(output)
+                yield f"data: {json.dumps(progress_chunk)}\n\n"
+                continue
             if first_token_time is None:
                 produced_at = getattr(output, "first_token_at", None)
                 if produced_at is None:
@@ -6071,11 +6253,9 @@ async def stream_chat_completion(
         cleaned_thinking = extraction.cleaned_thinking
         # Process response_format if specified
         if request.response_format and not tool_calls:
-            cleaned_text, parsed_json, is_valid, error = parse_json_output(
+            cleaned_text, _, is_valid, error = parse_json_output(
                 cleaned_text, request.response_format
             )
-            if parsed_json is not None:
-                cleaned_text = json.dumps(parsed_json)
             if not is_valid:
                 logger.warning(f"JSON validation failed: {error}")
 
@@ -6450,7 +6630,10 @@ async def stream_anthropic_messages(
     # This is needed for message_start event
     estimated_input_tokens = 0
     try:
-        if hasattr(engine, "tokenizer") and engine.tokenizer is not None:
+        prepared = kwargs.get("_prepared_prompt")
+        if prepared is not None:
+            estimated_input_tokens = len(prepared[1])
+        elif hasattr(engine, "tokenizer") and engine.tokenizer is not None:
             # Build the prompt using chat template
             template_kwargs = {"tokenize": False, "add_generation_prompt": True}
             if kwargs.get("tools"):
@@ -7078,7 +7261,8 @@ async def create_anthropic_message(
 
         # Validate context window before sending to model
         try:
-            num_prompt_tokens = engine.count_chat_tokens(
+            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
+                engine,
                 messages,
                 internal_tools,
                 chat_template_kwargs=merged_ct_kwargs or None,
@@ -7095,6 +7279,9 @@ async def create_anthropic_message(
                 raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
             raise
         validate_context_window(num_prompt_tokens, request.model)
+
+        if prepared_prompt is not None:
+            chat_kwargs["_prepared_prompt"] = prepared_prompt
 
         # Add stop sequences. Thinking comes back as its own block, so they
         # apply to the answer only (#3943).
@@ -7386,6 +7573,7 @@ async def _tokenize_chat_messages(
     )
     is_partial = chat_messages.is_partial or request.continue_final_message
     tools_for_template = _resolve_template_tools(chat_request, engine, resolved_model)
+    _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
     await _ensure_tokenizer_for_system_probe(engine, chat_messages.messages)
     messages = prepare_system_messages_for_template(
         chat_messages.messages,
@@ -7396,8 +7584,6 @@ async def _tokenize_chat_messages(
         merge_consecutive_roles=chat_messages.merge_system_fallback_roles,
         unsupported_mid_system_policy=_unsupported_mid_system_policy(),
     )
-    # Chat completions adds this after its context check, before rendering.
-    _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
     add_generation_prompt = (
         None if is_partial or request.add_generation_prompt else False
     )
@@ -7729,6 +7915,15 @@ async def create_response(
         tools_for_template = (
             convert_tools_for_template(effective_tools) if effective_tools else None
         )
+        # Resolve template defaults before preparing the prompt for reuse.
+        native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
+        if (
+            native_reasoning
+            and merged_ct_kwargs.get("enable_thinking") is not False
+            and "preserve_thinking" not in merged_ct_kwargs
+        ):
+            merged_ct_kwargs["preserve_thinking"] = True
+
         # Gemma 4 drops required params that lack descriptions — enrich them
         if tools_for_template and "gemma" in (resolved_model or "").lower():
             tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
@@ -7745,7 +7940,8 @@ async def create_response(
 
         # Validate context window
         try:
-            num_prompt_tokens = engine.count_chat_tokens(
+            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
+                engine,
                 messages,
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
@@ -7811,16 +8007,8 @@ async def create_response(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        # Auto-set preserve_thinking only when the template advertises support
-        # for it (Qwen 3.6+). Gated on detection so other templates don't
-        # receive an unknown kwarg.
-        native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
-        if (
-            native_reasoning
-            and merged_ct_kwargs.get("enable_thinking") is not False
-            and "preserve_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["preserve_thinking"] = True
+        if prepared_prompt is not None:
+            chat_kwargs["_prepared_prompt"] = prepared_prompt
 
         # Add compiled grammar for logit-level structured output.
         if compiled_grammar is not None:
@@ -7983,11 +8171,9 @@ async def create_response(
 
             # Process response_format if specified
             if response_format and not tool_calls:
-                cleaned_text, parsed_json, is_valid, error = parse_json_output(
+                cleaned_text, _, is_valid, error = parse_json_output(
                     cleaned_text or regular_content, response_format
                 )
-                if parsed_json is not None:
-                    cleaned_text = json.dumps(parsed_json)
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")
 
@@ -8095,6 +8281,7 @@ async def stream_responses_api(
     last_output = None
     accumulated_text = ""
     accumulated_reasoning = ""
+    message_deltas = []
     has_tools = bool(kwargs.get("tools"))
     # Some templates open the thinking block in the prompt itself, so the
     # generated text starts with reasoning body and only later emits </think>.
@@ -8382,6 +8569,7 @@ async def stream_responses_api(
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
+                        message_deltas.append(content_delta)
                         seq = stream_state.next_sequence()
                         yield format_sse_event(
                             "response.output_text.delta",
@@ -8451,6 +8639,7 @@ async def stream_responses_api(
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
             if content_delta:
+                message_deltas.append(content_delta)
                 seq = stream_state.next_sequence()
                 yield format_sse_event(
                     "response.output_text.delta",
@@ -8471,6 +8660,7 @@ async def stream_responses_api(
                         yield ev
                 for ev in _open_message():
                     yield ev
+                message_deltas.append(remaining)
                 seq = stream_state.next_sequence()
                 yield format_sse_event(
                     "response.output_text.delta",
@@ -8518,6 +8708,7 @@ async def stream_responses_api(
         if not stream_content and cleaned_text:
             for ev in _open_message():
                 yield ev
+            message_deltas.append(cleaned_text)
             seq = stream_state.next_sequence()
             yield format_sse_event(
                 "response.output_text.delta",
@@ -8557,6 +8748,7 @@ async def stream_responses_api(
                     yield ev
             for ev in _open_message():
                 yield ev
+            message_deltas.append(recovered_content)
             seq = stream_state.next_sequence()
             yield format_sse_event(
                 "response.output_text.delta",
@@ -8582,13 +8774,16 @@ async def stream_responses_api(
                 except (json.JSONDecodeError, AttributeError):
                     pass
 
-    final_text = cleaned_text.strip() if cleaned_text else ""
+    # Final message content must preserve the bytes already emitted to clients.
+    final_text = "".join(message_deltas)
 
     # Process response_format if specified
     if response_format and not tool_calls:
-        _, parsed_json, is_valid, error = parse_json_output(final_text, response_format)
-        if parsed_json is not None:
-            final_text = json.dumps(parsed_json)
+        json_text, _, is_valid, error = parse_json_output(final_text, response_format)
+        # Unconstrained output can wrap the JSON in prose or a code fence.
+        # Strip those so clients can parse the final text as JSON.
+        if json_text != final_text.strip():
+            final_text = json_text
         if not is_valid:
             logger.warning(f"JSON validation failed: {error}")
 

@@ -9,6 +9,7 @@ Supported levels: oQ2, oQ2.5, oQ2.7, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8
 base bits and add targeted routed-expert protection plus a higher bpw budget.
 """
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -201,7 +202,7 @@ def _apply_output_dtype(config: dict, dtype: str) -> None:
     A source config describes the checkpoint oQ read, not the one it writes,
     and nothing in the load path corrects it, so a float16 build of a bfloat16
     source reads back as bfloat16. Follows ``_clone_config`` in
-    ``tools/clone_mlx_model_fp16.py``, but only rewrites keys the source
+    ``scripts/clone_mlx_model_fp16.py``, but only rewrites keys the source
     declared rather than adding any. ``vision_config`` is left alone: under a
     float16 target, vision and audio weights are stored as float32.
     """
@@ -1530,13 +1531,23 @@ def combine_gemma4_assistant_mtp(
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
     """Atomically replace a JSON file (tmp write + rename)."""
-    with tempfile.NamedTemporaryFile(
-        "w", dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
-    ) as tmp:
-        json.dump(payload, tmp, indent=2)
-        tmp.flush()
-        temp_name = tmp.name
-    Path(temp_name).replace(path)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
+        ) as tmp:
+            # Record the name first so a failed dump still cleans up.
+            temp_name = tmp.name
+            json.dump(payload, tmp, indent=2)
+            tmp.flush()
+            # Make the data durable before the rename.
+            os.fsync(tmp.fileno())
+        Path(temp_name).replace(path)
+        temp_name = None
+    finally:
+        if temp_name is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temp_name)
 
 
 def _write_mtp_shard_and_merge_index(

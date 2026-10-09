@@ -2748,6 +2748,9 @@ def _smla_native(q, kv, idx, scale):
 @pytest.mark.parametrize(
     "L,K,topk,q_scale",
     [
+        (2, 2602, 2051, 1.0),
+        (4, 4100, 2051, 1.0),
+        (8, 8192, 2051, 3.0),
         (64, 256, 128, 1.0),
         (37, 700, 200, 1.0),
         (128, 4096, 2051, 1.0),
@@ -2861,7 +2864,7 @@ def test_nax_sparse_mla_probabilities_keep_fp32_precision():
     assert mx.all(err <= 0.5 * ulp + 0.02).item()
 
 
-def _make_sparse_attention():
+def _make_sparse_attention(*, head_dim=16):
     from mlx.utils import tree_map
     from mlx_vlm.models import glm5_next
     from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
@@ -2881,8 +2884,8 @@ def _make_sparse_attention():
         kv_lora_rank=512,
         q_lora_rank=32,
         qk_rope_head_dim=0,
-        v_head_dim=16,
-        qk_nope_head_dim=16,
+        v_head_dim=head_dim,
+        qk_nope_head_dim=head_dim,
         num_experts_per_tok=2,
         first_k_dense_replace=99,
         max_position_embeddings=8192,
@@ -2957,6 +2960,76 @@ def test_nax_sparse_mla_call_site_matches_fallback_paths(monkeypatch):
         e32, g32 = e.astype(mx.float32), g.astype(mx.float32)
         scale = mx.abs(e32).max().item()
         assert mx.abs(e32 - g32).max().item() <= tol * scale
+
+
+@_needs_nax_sparse_mla
+@pytest.mark.parametrize("length", [2, 4, 8])
+@pytest.mark.parametrize("bits", [None, 4])
+def test_nax_sparse_mla_short_verify_avoids_gather(monkeypatch, length, bits):
+    from mlx_lm.models.cache import KVCache, PoolingCache
+    from mlx_vlm.models.glm5_next import language
+
+    attn = _make_sparse_attention(head_dim=32)
+    if bits is not None:
+        nn.quantize(attn, group_size=32, bits=bits)
+    cache = [KVCache(), PoolingCache(4)]
+    mx.eval(attn(mx.random.normal((1, 2603, 64)).astype(mx.bfloat16), None, cache))
+    reference_cache = copy.deepcopy(cache)
+    x = mx.random.normal((1, length, 64)).astype(mx.bfloat16)
+    with monkeypatch.context() as fallback:
+        fallback.setattr(language, "sparse_mla_attention_nax", lambda *args: None)
+        expected = attn(x, None, reference_cache)
+        mx.eval(expected)
+
+    calls = []
+    original = sparse_mla_nax.sparse_mla_attention_nax
+
+    def nax(q, kv, indices, scale):
+        output = original(q, kv, indices, scale)
+        assert output is not None
+        calls.append(q.shape[2])
+        return output
+
+    def no_gather(*args, **kwargs):
+        pytest.fail("eligible short verification used gathered SDPA")
+
+    monkeypatch.setattr(language, "sparse_mla_attention_nax", nax)
+    monkeypatch.setattr(language, "scaled_dot_product_attention", no_gather)
+    got = attn(x, None, cache)
+    mx.eval(got)
+    assert calls == [length]
+    assert got.shape == expected.shape and got.dtype == expected.dtype
+    e32, g32 = expected.astype(mx.float32), got.astype(mx.float32)
+    assert mx.abs(e32 - g32).max().item() <= 1e-2 * mx.abs(e32).max().item()
+
+
+@pytest.mark.parametrize("batch,dtype", [(1, mx.float32), (2, mx.bfloat16)])
+def test_short_sparse_attention_preserves_unsupported_input_fallback(
+    monkeypatch, batch, dtype
+):
+    from mlx_vlm.models.glm5_next import language
+
+    q, kv, indices = _smla_inputs(4, 64, 32, dtype=dtype)
+    q, kv, indices = (mx.repeat(a, batch, axis=0) for a in (q, kv, indices))
+    attn = _make_sparse_attention()
+    attn.embed_q = attn.unembed_out = nn.Identity()
+    with monkeypatch.context() as fallback:
+        fallback.setattr(language, "sparse_mla_attention_nax", lambda *args: None)
+        expected = attn._gathered_attention(q, kv, indices)
+
+    calls = []
+    original = sparse_mla_nax.sparse_mla_attention_nax
+
+    def nax(*args):
+        output = original(*args)
+        assert output is None
+        calls.append(args[0].dtype)
+        return output
+
+    monkeypatch.setattr(language, "sparse_mla_attention_nax", nax)
+    got = attn._gathered_attention(q, kv, indices)
+    assert calls == [dtype]
+    assert got.dtype == dtype and mx.array_equal(got, expected).item()
 
 
 def _smla_realistic_inputs(L, K, H=64, dtype=mx.bfloat16, seed=0, topk_blocks=512):
@@ -3862,7 +3935,7 @@ def _check_small_model(seed=41, prompt_len=2101, heads=16, quantize_mla=False):
     before = dict(_stats())
     saved = language._DECODE_FUSION
     try:
-        for step, width in enumerate([1, 1, 4, 1, 7, 2, 1, 8, 3]):
+        for step, width in enumerate([1, 1, 4, 1, 7, 2, 1, 8, 3, 4, 8]):
             block = mx.concatenate(
                 [next_ids, (next_ids + mx.arange(1, width)[None]) % 256], axis=1
             )[:, :width]
@@ -4448,8 +4521,9 @@ def test_upstream_kda_prefill_then_fused_decode_is_bitwise_reference(monkeypatch
 
 @pytest.mark.usefixtures("glm5_fused_decode")
 @pytest.mark.parametrize("every", [1, 3])
-def test_decode_early_eval_only_schedules(every, monkeypatch):
-    """One-token decode forwards evaluate every few layers while the graph is
+@pytest.mark.parametrize("width", [1, 2, 4, 8])
+def test_decode_early_eval_only_schedules(every, width, monkeypatch):
+    """Decode/verify forwards evaluate every few layers while the graph is
     still being built; the logits and caches are those of the lazy forward."""
     language = _language()
     model = _fused_shape_model(seed=45)
@@ -4466,7 +4540,7 @@ def test_decode_early_eval_only_schedules(every, monkeypatch):
         calls.append(len(args))
         return real_async_eval(*args)
 
-    token = mx.array([[17]], dtype=mx.int32)
+    token = mx.arange(17, 17 + width, dtype=mx.int32)[None]
     for step in range(3):
         monkeypatch.setattr(language, "_DECODE_EVAL_EVERY", 0)
         lazy = model(token, cache=caches[0]).logits
@@ -4477,7 +4551,7 @@ def test_decode_early_eval_only_schedules(every, monkeypatch):
         monkeypatch.setattr(mx, "async_eval", real_async_eval)
         mx.eval(early)
         assert _mismatches(early, lazy) == 0, f"step {step}"
-        token = mx.argmax(lazy[:, -1:], axis=-1).astype(mx.int32)
+        token = mx.argmax(lazy, axis=-1).astype(mx.int32)
     # 4 layers: evaluations after layers `every`, 2 * every, ... (not the last).
     assert len(calls) == 3 * len(range(every, 4, every))
     for a, b in zip(caches[0], caches[1]):
