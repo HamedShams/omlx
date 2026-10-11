@@ -18,7 +18,6 @@ import copy
 import gc
 import json
 import logging
-import os
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
@@ -570,10 +569,7 @@ class EnginePool:
 
             fraction = runtime_settings.moe_expert_offload_resident_fraction
             if entry.config_model_type == "deepseek_v41":
-                if (
-                    v41_estimate is None
-                    and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
-                ):
+                if v41_estimate is None:
                     from .patches.deepseek_v41.moe_offload import (
                         estimate_expert_savings,
                     )
@@ -785,10 +781,7 @@ class EnginePool:
             estimate = deepseek_v41_residency_estimate(entry.model_path)
             if not estimate.supported:
                 return False, False, None
-            if (
-                getattr(settings, "moe_expert_offload_enabled", False)
-                and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
-            ):
+            if getattr(settings, "moe_expert_offload_enabled", False):
                 from .patches.deepseek_v41.moe_offload import estimate_expert_savings
 
                 saved = estimate_expert_savings(
@@ -1060,6 +1053,12 @@ class EnginePool:
         # Security/load gates.
         add("trust_remote_code", bool(data.get("trust_remote_code", False)))
         add("index_cache_freq", normalized_index_cache_freq())
+        # Embedding audio tower residency is decided at load. The audio length
+        # only matters while the tower is loaded.
+        audio_active = bool(data.get("embedding_audio_enabled", False))
+        add("embedding_audio_enabled", audio_active)
+        if audio_active:
+            add("embedding_audio_max_seconds", data.get("embedding_audio_max_seconds"))
 
         # Load-time model variants. Dependent fields only matter when their
         # feature is active; stale draft paths or tuning defaults must not
@@ -3706,6 +3705,12 @@ class EnginePool:
                         model_name=entry.model_path,
                         trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
+                        audio_enabled=bool(
+                            getattr(model_settings, "embedding_audio_enabled", False)
+                        ),
+                        audio_max_seconds=getattr(
+                            model_settings, "embedding_audio_max_seconds", None
+                        ),
                     )
                 elif effective_type == "reranker":
                     engine = RerankerEngine(

@@ -3,6 +3,7 @@
 import json
 import shutil
 import subprocess
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -333,6 +334,44 @@ def test_js_embedded_translations_escape_apostrophes():
     assert unsafe == []
 
 
+class _GateFinder(HTMLParser):
+    """Collect the x-show gates of the elements around a marker comment."""
+
+    _VOID = {"input", "br", "img", "hr", "meta", "link", "source"}
+
+    def __init__(self, marker: str):
+        super().__init__()
+        self._marker = marker
+        self._stack: list[str] = []
+        self.gates: list[str] | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in self._VOID:
+            self._stack.append(dict(attrs).get("x-show") or "")
+
+    def handle_endtag(self, tag):
+        if tag not in self._VOID:
+            self._stack.pop()
+
+    def handle_comment(self, data):
+        if self._marker in data:
+            self.gates = [gate for gate in self._stack if gate]
+
+
+def test_embedding_audio_toggle_is_outside_the_llm_only_list():
+    """The advanced list is hidden for embedding models, so the toggle sits after it."""
+    html = _model_settings_template()
+    finder = _GateFinder("Embedding audio input")
+    finder.feed(html)
+    assert finder.gates == []
+
+    section = _section(
+        html, "<!-- Embedding audio input (EmbeddingGemma 2) -->", "<!-- Actions -->"
+    )
+    assert 'x-show="selectedModel?.embedding_audio_supported"' in section
+    assert 'x-show="modelSettings.embedding_audio_enabled"' in section
+
+
 def test_oq_a8_toggle_is_gated_to_qwen35_models():
     """The kernels only exist for this checkpoint family, so the UI hides them."""
     html = _model_settings_template()
@@ -633,6 +672,11 @@ def test_dashboard_layout_template_contract():
         assert pill in status, block_id
         assert f"status.layout.block.{block_id}" in status
 
+    # Only Serving Stats has a tile picker beside its remove button.
+    assert status.count('@click="dashTilePickerOpen = !dashTilePickerOpen"') == 1
+    serving = status.split('gs-id="serving_stats"', 1)[1].split("dash-block-body")[0]
+    assert "dashTilePickerOpen = !dashTilePickerOpen" in serving
+
     assert "css/gridstack.min.css" in dashboard
     assert "js/gridstack-all.js" in dashboard
     assert "js/dashboard_layout.js" in dashboard
@@ -648,6 +692,8 @@ def test_dashboard_layout_template_contract():
         "status.layout.customize",
         "status.layout.width_full",
         "status.layout.save",
+        "status.layout.tiles",
+        "status.stat.generated_tokens",
         *[f"status.layout.block.{block_id}" for block_id in DASHBOARD_BLOCK_IDS],
     ]
     for locale in locales:
@@ -699,8 +745,105 @@ assert.deepEqual(plain(messy.blocks), [
     { id: 'applications', x: 0, y: 1, w: 24 },
 ]);
 assert.deepEqual(plain(lib.normalizeLayout({ width: 'full', blocks: [] }).blocks), []);
+
+const defaultTiles = ['requests', 'prefill_tokens', 'cached_tokens', 'cache_efficiency'];
+assert.deepEqual(plain(def.serving_stats_tiles), defaultTiles);
+assert.deepEqual(plain(messy.serving_stats_tiles), defaultTiles);
+const tiles = raw => plain(lib.normalizeLayout({ blocks: [], serving_stats_tiles: raw }).serving_stats_tiles);
+assert.deepEqual(tiles(['generated_tokens', 'bogus', 'requests', 'generated_tokens']),
+                 ['generated_tokens', 'requests']);
+assert.deepEqual(tiles([...lib.SERVING_TILE_IDS].reverse()),
+                 ['generated_tokens', 'cache_efficiency', 'cached_tokens', 'prefill_tokens']);
+assert.deepEqual(tiles([]), defaultTiles);
+assert.deepEqual(tiles('requests'), defaultTiles);
+
 assert.equal(lib.widthClass('wide'), 'max-w-[90rem]');
 assert.equal(lib.widthClass('bogus'), 'max-w-7xl');
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_dashboard_serving_tile_picker():
+    """The tile picker keeps 1-4 tiles and its drag order drives the stat tiles."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for dashboard layout tests")
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+
+const context = {
+    localStorage: { getItem: () => null },
+    window: { t: key => key },
+    document: { documentElement: { lang: 'en' } },
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync('omlx_web/static/js/dashboard_layout.js', 'utf8'), context);
+context.DashboardLayout = context.window.DashboardLayout;
+vm.runInContext(fs.readFileSync('omlx_web/static/js/dashboard.js', 'utf8'), context);
+const app = context.dashboard();
+const plain = value => JSON.parse(JSON.stringify(value));
+const ids = () => plain(app.servingStatTiles.map(tile => tile.id));
+
+app.dashLayout = context.DashboardLayout.defaultLayout();
+assert.deepEqual(ids(), ['requests', 'prefill_tokens', 'cached_tokens', 'cache_efficiency']);
+assert.equal(app.servingStatGridClass, 'sm:grid-cols-2 lg:grid-cols-4');
+
+app.dashEditing = true;
+app.dashDraft = { width: 'default', ...app._dashServingTileDraft(app.dashLayout.serving_stats_tiles) };
+assert.deepEqual(plain(app.dashDraft.servingTileOrder),
+                 ['requests', 'prefill_tokens', 'cached_tokens', 'cache_efficiency', 'generated_tokens']);
+
+// Four selected: the fifth is locked until one is cleared.
+assert.equal(app.dashTileLocked('generated_tokens'), true);
+app.toggleDashTile('generated_tokens');
+assert.equal(app.dashTileChecked('generated_tokens'), false);
+app.toggleDashTile('cached_tokens');
+app.toggleDashTile('generated_tokens');
+assert.deepEqual(ids(), ['requests', 'prefill_tokens', 'cache_efficiency', 'generated_tokens']);
+
+// Drag generated_tokens to the top, then requests down past cache_efficiency.
+app.dashTileDragStart('generated_tokens', {});
+app.dashTileDragOver('requests');
+app.dashTileDragEnd();
+app.dashTileDragStart('requests', {});
+app.dashTileDragOver('prefill_tokens');
+app.dashTileDragOver('cached_tokens');
+app.dashTileDragOver('cache_efficiency');
+app.dashTileDragEnd();
+assert.deepEqual(plain(app.dashDraft.servingTileOrder),
+                 ['generated_tokens', 'prefill_tokens', 'cached_tokens', 'cache_efficiency', 'requests']);
+assert.deepEqual(ids(), ['generated_tokens', 'prefill_tokens', 'cache_efficiency', 'requests']);
+assert.equal(app.dashTileDragId, null);
+
+// The last selected tile cannot be cleared.
+['generated_tokens', 'prefill_tokens', 'cache_efficiency'].forEach(id => app.toggleDashTile(id));
+assert.deepEqual(ids(), ['requests']);
+assert.equal(app.dashTileLocked('requests'), true);
+app.toggleDashTile('requests');
+assert.deepEqual(ids(), ['requests']);
+assert.equal(app.servingStatGridClass, '');
+
+// Values follow the stats scope.
+app.toggleDashTile('generated_tokens');
+app.toggleDashTile('cache_efficiency');
+app.stats = { ...app.stats, total_completion_tokens: 1234, cache_efficiency: 50 };
+app.alltimeStats = { ...app.alltimeStats, total_completion_tokens: 98765 };
+const tile = id => app.servingStatTiles.find(t => t.id === id);
+assert.equal(tile('generated_tokens').value, app.formatNumber(1234));
+assert.equal(tile('generated_tokens').label, 'status.stat.generated_tokens');
+assert.equal(tile('cache_efficiency').value, '50.0');
+assert.equal(tile('cache_efficiency').unit, '%');
+app.statsScope = 'alltime';
+assert.equal(tile('generated_tokens').value, app.formatNumber(98765));
 """
     result = subprocess.run(
         [node, "-e", script],

@@ -1244,6 +1244,30 @@ private struct AdvancedTab: View {
                     Task { await vm.save(.isFavorite, client: client) }
                 }))
             }
+            if vm.embeddingAudioSupported {
+                Row(label: String(localized: "settings.advanced.embedding_audio.label",
+                                  defaultValue: "Audio Input",
+                                  comment: "Row label for the embedding audio-input toggle"),
+                    sublabel: String(localized: "settings.advanced.embedding_audio.sub",
+                                     defaultValue: "Load the audio encoder so /v1/embeddings accepts audio items. Uses more memory even for text-only requests. Applies after the model reloads.",
+                                     comment: "Sublabel for the embedding audio-input toggle")) {
+                    RowSwitch(isOn: vm.bind($vm.embeddingAudioEnabled, save: {
+                        Task { await vm.save(.embeddingAudioEnabled, client: client) }
+                    }))
+                }
+                if vm.embeddingAudioEnabled {
+                    Row(label: String(localized: "settings.advanced.embedding_audio_max_seconds.label",
+                                      defaultValue: "Max Audio Length",
+                                      comment: "Row label for the embedding audio length limit"),
+                        sublabel: String(localized: "settings.advanced.embedding_audio_max_seconds.sub",
+                                         defaultValue: "Longer audio is cut at this length (empty = 30 s). The model context caps it at about 5 minutes.",
+                                         comment: "Sublabel for the embedding audio length limit")) {
+                        TextInput(text: $vm.embeddingAudioMaxSeconds,
+                                  placeholder: "30", mono: true, suffix: "s", width: .controlCompact)
+                            .onSubmit { Task { await vm.save(.embeddingAudioMaxSeconds, client: client) } }
+                    }
+                }
+            }
             // Security-sensitive row — flagged red to match the HTML
             // editor's visual treatment. HF custom-code execution gives
             // the model author the ability to run arbitrary Python in

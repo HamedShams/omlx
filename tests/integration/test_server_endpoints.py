@@ -1899,6 +1899,21 @@ class TestRerankEndpoint:
         calls = mock_engine_pool._reranker_engine.calls
         assert [call["kwargs"]["max_length"] for call in calls] == [None, 8192]
 
+    def test_rerank_forwards_instruction(self, client, mock_engine_pool):
+        mock_engine_pool._models.append(
+            {"id": "test-rerank-model", "loaded": True, "pinned": False, "size": 500000}
+        )
+        body = {"model": "test-rerank-model", "query": "q", "documents": ["d"]}
+
+        for extra in ({}, {"instruction": "Find numeric limits"}):
+            assert client.post("/v1/rerank", json={**body, **extra}).status_code == 200
+
+        calls = mock_engine_pool._reranker_engine.calls
+        assert [call["kwargs"]["instruction"] for call in calls] == [
+            None,
+            "Find numeric limits",
+        ]
+
     def test_rerank_response_format(self, client, mock_engine_pool):
         """Test rerank response format."""
         mock_engine_pool._models.append(
@@ -1962,6 +1977,26 @@ class TestSystemOneEndpoint:
             "tech": None,
         }
 
+    def test_systemone_leases_model_before_encode(
+        self, client, mock_engine_pool, mock_decision_engine
+    ):
+        # An idle decision model can be evicted while encode() runs (#4413).
+        leases_at_encode = []
+        encode = mock_decision_engine.encode
+
+        async def leased_encode(request, truncate=True):
+            leased = sum(call["_lease"] for call in mock_engine_pool.get_engine_calls)
+            leases_at_encode.append(leased - len(mock_engine_pool.release_calls))
+            return await encode(request, truncate)
+
+        mock_decision_engine.encode = leased_encode
+        response = client.post("/v1/systemone", json=self._BODY)
+
+        assert response.status_code == 200
+        assert leases_at_encode == [1]
+        assert [call["_lease"] for call in mock_engine_pool.get_engine_calls] == [True]
+        assert mock_engine_pool.release_calls == ["test-clef-model"]
+
     @pytest.mark.parametrize(
         "error,status",
         [
@@ -1970,12 +2005,13 @@ class TestSystemOneEndpoint:
         ],
     )
     def test_systemone_request_errors_keep_status(
-        self, client, mock_decision_engine, error, status
+        self, client, mock_engine_pool, mock_decision_engine, error, status
     ):
         mock_decision_engine.encode_error = error
         response = client.post("/v1/systemone", json=self._BODY)
         assert response.status_code == status
         assert str(error) in response.text
+        assert mock_engine_pool.release_calls == ["test-clef-model"]
 
     def test_systemone_rejects_non_decision_model(self, client):
         response = client.post(

@@ -490,6 +490,16 @@ class ModelSettings:
     # (modeling_*.py, tokenization_*.py). Off by default — see issue #926.
     trust_remote_code: bool = False
 
+    # Embedding models with an audio tower (EmbeddingGemma 2): load it so
+    # /v1/embeddings accepts items[].audio. Off by default because the tower is
+    # resident even for text-only requests (EmbeddingGemma 2: 0.88 -> 1.46 GB).
+    embedding_audio_enabled: bool = False
+    # Longest audio item, in seconds, an embedding model reads before cutting
+    # the waveform. None keeps the processor default (Gemma 4 audio: 30 s).
+    # The model's context still bounds it: EmbeddingGemma 2 fits about 327 s
+    # (8192 tokens at 40 ms each); longer inputs get the token-limit error.
+    embedding_audio_max_seconds: Optional[float] = None
+
     # Metadata
     display_name: Optional[str] = None
     description: Optional[str] = None

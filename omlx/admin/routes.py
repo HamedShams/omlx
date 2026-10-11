@@ -417,6 +417,8 @@ class ModelSettingsRequest(BaseModel):
     is_favorite: bool | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
+    embedding_audio_enabled: bool | None = None
+    embedding_audio_max_seconds: float | None = Field(default=None, gt=0)
 
     @field_validator("turboquant_kv_bits")
     @classmethod
@@ -575,6 +577,18 @@ DASHBOARD_BLOCK_IDS = (
     "applications",
     "engine_versions",
 )
+DASHBOARD_SERVING_TILE_IDS = (
+    "requests",
+    "prefill_tokens",
+    "cached_tokens",
+    "cache_efficiency",
+    "generated_tokens",
+)
+DASHBOARD_SERVING_TILE_MAX = 4
+
+
+def _default_serving_tiles() -> list[str]:
+    return list(DASHBOARD_SERVING_TILE_IDS[:DASHBOARD_SERVING_TILE_MAX])
 
 
 class DashboardLayoutBlock(BaseModel):
@@ -598,6 +612,8 @@ class DashboardLayoutRequest(BaseModel):
     version: Literal[1] = 1
     width: Literal["default", "wide", "wider", "full"] = "default"
     blocks: list[DashboardLayoutBlock] = Field(default_factory=list)
+    # Serving Stats tiles in left-to-right order.
+    serving_stats_tiles: list[str] = Field(default_factory=_default_serving_tiles)
 
     @field_validator("blocks")
     @classmethod
@@ -612,6 +628,16 @@ class DashboardLayoutRequest(BaseModel):
             seen.add(block.id)
             kept.append(block)
         return kept
+
+    @field_validator("serving_stats_tiles")
+    @classmethod
+    def _known_unique_tiles(cls, tiles):
+        kept = list(dict.fromkeys(t for t in tiles if t in DASHBOARD_SERVING_TILE_IDS))
+        if len(kept) > DASHBOARD_SERVING_TILE_MAX:
+            raise ValueError(
+                f"at most {DASHBOARD_SERVING_TILE_MAX} serving stats tiles allowed"
+            )
+        return kept or _default_serving_tiles()
 
 
 class GlobalSettingsRequest(BaseModel):
@@ -2199,6 +2225,7 @@ def _model_options(model_info: dict, settings) -> dict:
         "ane_prefill_default_fraction": ane_prefill_fraction(None, model_type),
         "ane_prefill_mlp_fractions": [1 / 3, 0.5] if ane_backend == "k2" else [],
         "ane_prefill_shared_fractions": [0, 1 / 3, 1] if ane_backend == "k2" else [],
+        "embedding_audio_supported": model_type == "embedding_gemma2",
     }
 
 
@@ -3253,6 +3280,14 @@ async def update_model_settings(
         current_settings.is_favorite = request.is_favorite
     if "trust_remote_code" in sent:
         current_settings.trust_remote_code = bool(request.trust_remote_code)
+    if "embedding_audio_enabled" in sent:
+        current_settings.embedding_audio_enabled = bool(
+            request.embedding_audio_enabled
+        )
+    if "embedding_audio_max_seconds" in sent:
+        current_settings.embedding_audio_max_seconds = (
+            request.embedding_audio_max_seconds
+        )
 
     if is_diffusion_model:
         _sanitize_diffusion_model_settings(current_settings)
